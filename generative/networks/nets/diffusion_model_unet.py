@@ -334,9 +334,9 @@ class SpatialTransformer(nn.Module):
             x = block(x, context=context)
 
         if self.spatial_dims == 2:
-            x = x.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2)
+            x = x.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
         if self.spatial_dims == 3:
-            x = x.reshape(batch, height, width, depth, inner_dim).permute(0, 4, 1, 2, 3)
+            x = x.reshape(batch, height, width, depth, inner_dim).permute(0, 4, 1, 2, 3).contiguous()
 
         x = self.proj_out(x)
         return x + residual
@@ -468,7 +468,8 @@ def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_peri
         embedding_dim: the dimension of the output.
         max_period: controls the minimum frequency of the embeddings.
     """
-    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+    if timesteps.ndim != 1:
+        raise ValueError("Timesteps should be a 1d-array")
 
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
@@ -491,7 +492,8 @@ class Downsample(nn.Module):
     Args:
         spatial_dims: number of spatial dimensions.
         num_channels: number of input channels.
-        use_conv: if True uses Convolution instead of Pool average to perform downsampling.
+        use_conv: if True uses Convolution instead of Pool average to perform downsampling. In case that use_conv is
+            False, the number of output channels must be the same as the number of input channels.
         out_channels: number of output channels.
         padding: controls the amount of implicit zero-paddings on both sides for padding number of points
             for each dimension.
@@ -515,12 +517,17 @@ class Downsample(nn.Module):
                 conv_only=True,
             )
         else:
-            assert self.num_channels == self.out_channels
+            if self.num_channels != self.out_channels:
+                raise ValueError("num_channels and out_channels must be equal when use_conv=False")
             self.op = Pool[Pool.AVG, spatial_dims](kernel_size=2, stride=2)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor | None = None) -> torch.Tensor:
         del emb
-        assert x.shape[1] == self.num_channels
+        if x.shape[1] != self.num_channels:
+            raise ValueError(
+                f"Input number of channels ({x.shape[1]}) is not equal to expected number of channels "
+                f"({self.num_channels})"
+            )
         return self.op(x)
 
 
@@ -559,7 +566,8 @@ class Upsample(nn.Module):
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor | None = None) -> torch.Tensor:
         del emb
-        assert x.shape[1] == self.num_channels
+        if x.shape[1] != self.num_channels:
+            raise ValueError("Input channels should be equal to num_channels")
 
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # https://github.com/pytorch/pytorch/issues/86679
@@ -1702,6 +1710,9 @@ class DiffusionModelUNet(nn.Module):
                 "`num_channels`."
             )
 
+        if use_flash_attention and not has_xformers:
+            raise ValueError("use_flash_attention is True but xformers is not installed.")
+
         if use_flash_attention is True and not torch.cuda.is_available():
             raise ValueError(
                 "torch.cuda.is_available() should be True but is False. Flash attention is only available for GPU."
@@ -1840,6 +1851,8 @@ class DiffusionModelUNet(nn.Module):
         timesteps: torch.Tensor,
         context: torch.Tensor | None = None,
         class_labels: torch.Tensor | None = None,
+        down_block_additional_residuals: tuple[torch.Tensor] | None = None,
+        mid_block_additional_residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1847,6 +1860,8 @@ class DiffusionModelUNet(nn.Module):
             timesteps: timestep tensor (N,).
             context: context tensor (N, 1, ContextDim).
             class_labels: context tensor (N, ).
+            down_block_additional_residuals: additional residual tensors for down blocks (N, C, FeatureMapsDims).
+            mid_block_additional_residual: additional residual tensor for mid block (N, C, FeatureMapsDims).
         """
         # 1. time
         t_emb = get_timestep_embedding(timesteps, self.block_out_channels[0])
@@ -1877,8 +1892,23 @@ class DiffusionModelUNet(nn.Module):
             for residual in res_samples:
                 down_block_res_samples.append(residual)
 
+        # Additional residual conections for Controlnets
+        if down_block_additional_residuals is not None:
+            new_down_block_res_samples = ()
+            for down_block_res_sample, down_block_additional_residual in zip(
+                down_block_res_samples, down_block_additional_residuals
+            ):
+                down_block_res_sample = down_block_res_sample + down_block_additional_residual
+                new_down_block_res_samples += (down_block_res_sample,)
+
+            down_block_res_samples = new_down_block_res_samples
+
         # 5. mid
         h = self.middle_block(hidden_states=h, temb=emb, context=context)
+
+        # Additional residual conections for Controlnets
+        if mid_block_additional_residual is not None:
+            h = h + mid_block_additional_residual
 
         # 6. up
         for upsample_block in self.up_blocks:
